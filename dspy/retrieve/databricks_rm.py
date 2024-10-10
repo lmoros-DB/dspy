@@ -9,6 +9,24 @@ import dspy
 from dspy.primitives.prediction import Prediction
 
 _databricks_sdk_installed = find_spec("databricks.sdk") is not None
+_mlflow_installed = find_spec("mlflow") is not None
+
+from dataclasses import dataclass
+from typing import Any, Dict
+
+
+@dataclass
+class Document:
+    page_content: str
+    metadata: Dict[str, Any]
+    type: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "page_content": self.page_content,
+            "metadata": self.metadata,
+            "type": self.type,
+        }
 
 
 class DatabricksRM(dspy.Retrieve):
@@ -102,11 +120,20 @@ class DatabricksRM(dspy.Retrieve):
                 containing document text to retrieve.
         """
         super().__init__(k=k)
-        self.databricks_token = databricks_token if databricks_token is not None else os.environ.get("DATABRICKS_TOKEN")
-        self.databricks_endpoint = (
-            databricks_endpoint if databricks_endpoint is not None else os.environ.get("DATABRICKS_HOST")
+        self.databricks_token = (
+            databricks_token
+            if databricks_token is not None
+            else os.environ.get("DATABRICKS_TOKEN")
         )
-        if not _databricks_sdk_installed and (self.databricks_token, self.databricks_endpoint).count(None) > 0:
+        self.databricks_endpoint = (
+            databricks_endpoint
+            if databricks_endpoint is not None
+            else os.environ.get("DATABRICKS_HOST")
+        )
+        if (
+            not _databricks_sdk_installed
+            and (self.databricks_token, self.databricks_endpoint).count(None) > 0
+        ):
             raise ValueError(
                 "To retrieve documents with Databricks Vector Search, you must install the"
                 " databricks-sdk Python library, supply the databricks_token and"
@@ -119,6 +146,13 @@ class DatabricksRM(dspy.Retrieve):
         self.k = k
         self.docs_id_column_name = docs_id_column_name
         self.text_column_name = text_column_name
+        if _mlflow_installed:
+            import mlflow
+
+            mlflow.models.set_retriever_schema(
+                primary_key="primary_key",
+                text_column="page_content"
+            )
 
     def _extract_doc_ids(self, item: Dict[str, Any]) -> str:
         """Extracts the document id from a search result
@@ -141,11 +175,21 @@ class DatabricksRM(dspy.Retrieve):
         Returns:
             Dict[str, Any]: Search result column values, excluding the "text" and not "id" columns.
         """
-        extra_columns = {k: v for k, v in item.items() if k not in [self.docs_id_column_name, self.text_column_name]}
+        extra_columns = {
+            k: v
+            for k, v in item.items()
+            if k not in [self.docs_id_column_name, self.text_column_name]
+        }
         if self.docs_id_column_name == "metadata":
             extra_columns = {
                 **extra_columns,
-                **{"metadata": {k: v for k, v in json.loads(item["metadata"]).items() if k != "document_id"}},
+                **{
+                    "metadata": {
+                        k: v
+                        for k, v in json.loads(item["metadata"]).items()
+                        if k != "document_id"
+                    }
+                },
             }
         return extra_columns
 
@@ -226,7 +270,9 @@ class DatabricksRM(dspy.Retrieve):
             )
 
         if self.text_column_name not in col_names:
-            raise Exception(f"text_column_name: '{self.text_column_name}' is not in the index columns: \n {col_names}")
+            raise Exception(
+                f"text_column_name: '{self.text_column_name}' is not in the index columns: \n {col_names}"
+            )
 
         # Extracting the results
         items = []
@@ -239,12 +285,42 @@ class DatabricksRM(dspy.Retrieve):
         # Sorting results by score in descending order
         sorted_docs = sorted(items, key=lambda x: x["score"], reverse=True)[: self.k]
 
+        if _mlflow_installed:
+            self._log_documents(query_text, sorted_docs)
+
         # Returning the prediction
         return Prediction(
             docs=[doc[self.text_column_name] for doc in sorted_docs],
             doc_ids=[self._extract_doc_ids(doc) for doc in sorted_docs],
             extra_columns=[self._get_extra_columns(item) for item in sorted_docs],
         )
+
+    def _log_documents(self, query_text: str, sorted_docs: List[Dict[str, Any]]):
+        import mlflow
+
+        for doc in sorted_docs:
+            document = Document(
+                page_content=doc[self.text_column_name],
+                metadata={
+                    "primary_key": self._extract_doc_ids(doc),
+                    "similarity_score": doc["score"],
+                }
+                | {
+                    k: v
+                    for k, v in doc.items()
+                    if k
+                    not in ["score", self.text_column_name, self.docs_id_column_name]
+                },
+                type="Document",
+            ).to_dict()
+
+            with mlflow.start_span(
+                name=self.databricks_index_name, span_type="RETRIEVER"
+            ) as span:
+                span.set_inputs({"query": query_text})
+                span.set_outputs([document])
+                mlflow.trace
+        return None
 
     @staticmethod
     def _query_via_databricks_sdk(
@@ -281,9 +357,13 @@ class DatabricksRM(dspy.Retrieve):
         from databricks.sdk import WorkspaceClient
 
         if (query_text, query_vector).count(None) != 1:
-            raise ValueError("Exactly one of query_text or query_vector must be specified.")
+            raise ValueError(
+                "Exactly one of query_text or query_vector must be specified."
+            )
 
-        databricks_client = WorkspaceClient(host=databricks_endpoint, token=databricks_token)
+        databricks_client = WorkspaceClient(
+            host=databricks_endpoint, token=databricks_token
+        )
         return databricks_client.vector_search_indexes.query_index(
             index_name=index_name,
             query_type=query_type,
@@ -325,7 +405,9 @@ class DatabricksRM(dspy.Retrieve):
             Dict[str, Any]: Parsed JSON response from the Databricks Vector Search Index query.
         """
         if (query_text, query_vector).count(None) != 1:
-            raise ValueError("Exactly one of query_text or query_vector must be specified.")
+            raise ValueError(
+                "Exactly one of query_text or query_vector must be specified."
+            )
 
         headers = {
             "Authorization": f"Bearer {databricks_token}",
