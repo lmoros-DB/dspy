@@ -151,7 +151,8 @@ class DatabricksRM(dspy.Retrieve):
 
             mlflow.models.set_retriever_schema(
                 primary_key="primary_key",
-                text_column="page_content"
+                text_column="page_content",
+                doc_uri="doc_uri",
             )
 
     def _extract_doc_ids(self, item: Dict[str, Any]) -> str:
@@ -303,6 +304,7 @@ class DatabricksRM(dspy.Retrieve):
                 page_content=doc[self.text_column_name],
                 metadata={
                     "primary_key": self._extract_doc_ids(doc),
+                    "doc_uri": f"index/{self.databricks_index_name}/id/{self._extract_doc_ids(doc)}",
                     "similarity_score": doc["score"],
                 }
                 | {
